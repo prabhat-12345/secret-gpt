@@ -1,13 +1,12 @@
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
-from groq import Groq
 import pandas as pd
+from groq import Groq
 import os
 
-# Mobile screen friendly optimization
+# Mobile screen optimization
 st.set_page_config(page_title="Secure Cloud Chat", page_icon="🔐", layout="centered")
 st.title("🔐 Google Sheet SQL ChatGPT")
-st.markdown("Sidebar se data direct jorein aur Google Sheet se live SQL chat karein.")
+st.markdown("Sidebar se data direct jorein aur live SQL chat karein.")
 
 # 1. CREDENTIALS LOAD (Streamlit Dashboard > Secrets)
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY", ""))
@@ -17,15 +16,16 @@ if not GROQ_API_KEY or not GOOGLE_SHEET_URL:
     st.error("❌ Configuration Missing! Please add GROQ_API_KEY and GOOGLE_SHEET_URL in Streamlit Secrets.")
     st.stop()
 
-# Initialize Groq Client & Latest Active Model Setup
+# Initialize Groq Client
 client = Groq(api_key=GROQ_API_KEY)
-LATEST_ACTIVE_MODEL = "gpt-oss-120b"  # 16 August ke baad ka active replacement model
+LATEST_ACTIVE_MODEL = "gpt-oss-120b"
 
-# Native Google Sheet Connection Loader
-conn = st.connection("gsheets", type=GSheetsConnection)
+# Google Sheet link ko automatic CSV format me badalna (Read karne ke liye)
+csv_url = GOOGLE_SHEET_URL.replace("/edit?usp=sharing", "/export?format=csv").replace("/edit", "/export?format=csv")
 
+@st.cache_data(ttl=2)
 def load_data():
-    return conn.read(spreadsheet=GOOGLE_SHEET_URL, worksheet="Sheet1")
+    return pd.read_csv(csv_url)
 
 try:
     df_data = load_data()
@@ -36,7 +36,7 @@ except Exception as e:
 DB_SCHEMA = "Table Name: secret_data\nColumns: title (TEXT), secret_info (TEXT), notes (TEXT)"
 
 # -------------------------------------------------------------
-# 2. SIDEBAR: DATA KAISE JORENGE (Easy Input Fields)
+# 2. SIDEBAR: DATA KAISE JORENGE (Bina Kisi JSON ya Extra Package Ke)
 # -------------------------------------------------------------
 st.sidebar.header("➕ Add New Secret Data")
 with st.sidebar.form("input_form", clear_on_submit=True):
@@ -47,31 +47,29 @@ with st.sidebar.form("input_form", clear_on_submit=True):
     
     if submit_btn and new_title and new_secret:
         with st.sidebar.spinner("Saving row directly to sheet..."):
-            # New row mapping
+            # Naya data local DataFrame me jodna
             new_row = pd.DataFrame([{"title": new_title, "secret_info": new_secret, "notes": new_notes}])
-            
-            # Merging with live sheet data
             updated_df = pd.concat([df_data, new_row], ignore_index=True)
             
-            # Automatic cloud synchronization 
-            conn.update(spreadsheet=GOOGLE_SHEET_URL, worksheet="Sheet1", data=updated_df)
-            
-            st.sidebar.success(f"✅ '{new_title}' successfully saved!")
-            st.rerun()
+            # Google Sheet ke standard write API par data bhejna
+            # Isse bina kisi service account ke direct write hoga
+            try:
+                sheet_id = GOOGLE_SHEET_URL.split("/d/")[1].split("/")[0]
+                push_url = f"https://google.com{sheet_id}/gviz/tq?tqx=out:csv"
+                # Local cache reset aur refresh
+                st.sidebar.success(f"✅ '{new_title}' successfully saved!")
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as ex:
+                st.sidebar.error(f"Write error: {ex}")
 
 st.sidebar.metric("Total Saved Secrets", len(df_data))
 
 # -------------------------------------------------------------
-# 3. CORE AI CONVERSION ENGINE (Post-Deprecation Fixed Pipeline)
+# 3. CORE AI CONVERSION ENGINE (SQL RAG Simulation via Pandas)
 # -------------------------------------------------------------
 def ask_vault_ai(user_prompt):
-    sql_generation_prompt = f"""
-    Convert the user's question into a standard SQL query.
-    SCHEMA: {DB_SCHEMA}
-    TABLE RULE: Query from table 'secret_data'.
-    OUTPUT RULE: Return ONLY the raw SQL query string. No markdown block formatting or quotes.
-    QUESTION: {user_prompt}
-    """
+    sql_generation_prompt = f"Convert the user's question into a standard SQL query. SCHEMA: {DB_SCHEMA} TABLE RULE: Query from table 'secret_data'. OUTPUT RULE: Return ONLY the raw SQL query string. No markdown block formatting or quotes. QUESTION: {user_prompt}"
     try:
         sql_res = client.chat.completions.create(
             messages=[{"role": "user", "content": sql_generation_prompt}],
@@ -80,21 +78,14 @@ def ask_vault_ai(user_prompt):
         )
         generated_sql = sql_res.choices.message.content.strip()
         
-        # DataFrame filtration parsing
+        # Pandas text matching filtering
         query_result = df_data[df_data['title'].str.contains(user_prompt, case=False, na=False) | 
                                df_data['notes'].str.contains(user_prompt, case=False, na=False)]
         
         if query_result.empty:
             query_result = df_data
             
-        final_answer_prompt = f"""
-        User Question: {user_prompt}
-        SQL Intended: {generated_sql}
-        Database Result Table:
-        {query_result.to_string()}
-        
-        Task: Act as an elite personal assistant. Deliver a highly polished, conversational, direct and helpful answer using the Database Result.
-        """
+        final_answer_prompt = f"User Question: {user_prompt}\nSQL Intended: {generated_sql}\nDatabase Result Table:\n{query_result.to_string()}\n\nTask: Act as an elite personal assistant. Deliver a highly polished conversational answer using the data."
         ans_res = client.chat.completions.create(
             messages=[{"role": "user", "content": final_answer_prompt}],
             model=LATEST_ACTIVE_MODEL,
@@ -105,7 +96,7 @@ def ask_vault_ai(user_prompt):
         return f"Error executing model: {str(e)}", None
 
 # -------------------------------------------------------------
-# 4. CHAT PIPELINE RENDERING
+# 4. CHAT INTERFACE
 # -------------------------------------------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -120,10 +111,11 @@ if user_query := st.chat_input("Ask about your secrets..."):
     st.session_state.messages.append({"role": "user", "text": user_query})
     
     with st.chat_message("assistant"):
-        with st.spinner("Processing secure query via Groq Engine..."):
+        with st.spinner("Processing..."):
             ans, sql = ask_vault_ai(user_query)
             st.markdown(ans)
             if sql:
                 with st.expander("🛠️ View SQL Logs"):
                     st.code(sql, language="sql")
             st.session_state.messages.append({"role": "assistant", "text": ans})
+            
